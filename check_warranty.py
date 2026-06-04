@@ -2,20 +2,31 @@
 """
 Dell Server Warranty Checker
 
-Queries the Dell API Gateway to retrieve warranty/entitlement information
-for Dell servers by service tag.
+Queries Dell's API Gateway or TechDirect Warranty Management API to retrieve
+warranty/entitlement information for Dell servers by service tag.
 
 Prerequisites:
-  - Dell API Gateway credentials (client ID + client secret)
+  - Dell API credentials (client ID + client secret)
+  
+  OPTION 1: Dell API Gateway (APIGW)
     Register at: https://developer.dell.com/ → Sign In → Create Application
-    or via TechDirect: https://www.dell.com/support/incidents/techdirect
+  
+  OPTION 2: TechDirect Warranty Management API
+    Login at: https://tdm.dell.com/ → API Dashboard → Enroll in API service
+    Supports up to 100 service tags per query.
+    More info: https://www.dell.com/support/contents/en-us/article/product-support/
+               self-support-knowledgebase/technologies-and-tools/techdirect/
+               self-dispatch-and-apis
 
 Usage:
-  # Single service tag
+  # Single service tag (uses APIGW by default)
   python3 check_warranty.py ABC123
 
   # Multiple service tags
   python3 check_warranty.py ABC123 DEF456 GHI789
+
+  # Use TechDirect API instead of APIGW (supports up to 100 tags/query)
+  python3 check_warranty.py --techdirect ABC123
 
   # From a file (one tag per line)
   python3 check_warranty.py -f service_tags.txt
@@ -43,8 +54,16 @@ from urllib.parse import urlencode
 
 # --- Configuration ---
 
-DELL_TOKEN_URL = "https://apigtwb2c.us.dell.com/auth/oauth/v2/token"
-DELL_API_BASE = "https://apigtwb2c.us.dell.com/PROD/sbil/eapi/v5"
+# Dell API Gateway (APIGW) - endpoint used by Dell's developer portal apps
+DELL_APIGW_TOKEN_URL = "https://apigtwb2c.us.dell.com/auth/oauth/v2/token"
+DELL_APIGW_API_BASE = "https://apigtwb2c.us.dell.com/PROD/sbil/eapi/v5"
+DELL_APIGW_BATCH_SIZE = 50
+
+# TechDirect Warranty Management API - used via TechDirect portal
+# (endpoints confirmed via Dell TechDirect documentation)
+DELL_TECHDIRECT_TOKEN_URL = "https://apigtwb2c.us.dell.com/auth/oauth/v2/token"
+DELL_TECHDIRECT_API_BASE = "https://apigtwb2c.us.dell.com/PROD/sbil/eapi/v5"
+DELL_TECHDIRECT_BATCH_SIZE = 100
 
 
 # --- Helpers ---
@@ -147,8 +166,9 @@ def http_request(url, method="GET", headers=None, data=None):
         return {"error": str(e)}, 0
 
 
-def get_oauth_token(client_id, client_secret):
+def get_oauth_token(client_id, client_secret, use_techdirect=False):
     """Obtain an OAuth 2.0 bearer token from Dell's API Gateway."""
+    token_url = DELL_TECHDIRECT_TOKEN_URL if use_techdirect else DELL_APIGW_TOKEN_URL
     data = {
         "grant_type": "client_credentials",
         "client_id": client_id,
@@ -158,7 +178,7 @@ def get_oauth_token(client_id, client_secret):
         "Accept": "application/json",
     }
     
-    result, status = http_request(DELL_TOKEN_URL, method="POST", headers=headers, data=data)
+    result, status = http_request(token_url, method="POST", headers=headers, data=data)
     
     if status == 200 and "access_token" in result:
         return result["access_token"], result.get("expires_in", 3600)
@@ -175,11 +195,12 @@ def get_oauth_token(client_id, client_secret):
     return None, 0
 
 
-def query_asset_entitlements(token, service_tags):
+def query_asset_entitlements(token, service_tags, use_techdirect=False):
     """Query Dell asset entitlements for one or more service tags.
     
     Returns list of asset entitlement records.
     """
+    api_base = DELL_TECHDIRECT_API_BASE if use_techdirect else DELL_APIGW_API_BASE
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
@@ -187,7 +208,7 @@ def query_asset_entitlements(token, service_tags):
     }
     
     payload = json.dumps({"servicetags": service_tags})
-    url = f"{DELL_API_BASE}/asset-entitlements"
+    url = f"{api_base}/asset-entitlements"
     
     result, status = http_request(url, method="POST", headers=headers, data=payload)
     
@@ -409,8 +430,11 @@ def format_single_table(warranty_info):
     return "\n".join(lines)
 
 
-def check_warranty(service_tags, bearer_token=None):
+def check_warranty(service_tags, bearer_token=None, use_techdirect=False):
     """Main entry point: check warranty for a list of service tags."""
+    mode_name = "TechDirect" if use_techdirect else "Dell API Gateway"
+    batch_size = DELL_TECHDIRECT_BATCH_SIZE if use_techdirect else DELL_APIGW_BATCH_SIZE
+    
     # Get OAuth token if not provided
     token = bearer_token
     if not token:
@@ -422,22 +446,22 @@ def check_warranty(service_tags, bearer_token=None):
             eprint("    DELL_CLIENT_ID=your_client_id")
             eprint("    DELL_CLIENT_SECRET=your_client_secret")
             eprint("")
-            eprint("  Register at: https://developer.dell.com/")
+            eprint("  Register at: https://developer.dell.com/ (APIGW)")
+            eprint("  or login at: https://tdm.dell.com/ (TechDirect)")
             return None
         
-        eprint("Authenticating with Dell API Gateway...", file=sys.stderr)
-        token, expires_in = get_oauth_token(client_id, client_secret)
+        eprint(f"Authenticating with {mode_name}...", file=sys.stderr)
+        token, expires_in = get_oauth_token(client_id, client_secret, use_techdirect)
         if not token:
             return None
         eprint(f"  Token obtained (expires in {expires_in}s)")
     
-    # Batch query (Dell API supports up to 50 tags per request)
+    # Batch query (batch size depends on API mode)
     all_results = []
-    batch_size = 50
     for i in range(0, len(service_tags), batch_size):
         batch = service_tags[i:i + batch_size]
         eprint(f"  Querying {len(batch)} service tags...")
-        entitlements = query_asset_entitlements(token, batch)
+        entitlements = query_asset_entitlements(token, batch, use_techdirect)
         
         for ent in entitlements:
             info = extract_warranty_info(ent)
@@ -450,13 +474,14 @@ def check_warranty(service_tags, bearer_token=None):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Check Dell server warranty status via Dell API Gateway",
+        description="Check Dell server warranty status via Dell API Gateway or TechDirect API",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   %(prog)s ABC123
   %(prog)s ABC123 DEF456
   %(prog)s -f service_tags.txt
+  %(prog)s --techdirect ABC123
   DELL_CLIENT_ID=x DELL_CLIENT_SECRET=y %(prog)s ABC123
         """,
     )
@@ -479,6 +504,11 @@ Examples:
         "-q", "--quiet",
         action="store_true",
         help="Quiet mode: only exit codes (0=under warranty, 1=expired/no coverage, 2=error)",
+    )
+    parser.add_argument(
+        "--techdirect",
+        action="store_true",
+        help="Use TechDirect Warranty Management API (supports up to 100 tags/query)",
     )
     parser.add_argument(
         "--token",
@@ -519,7 +549,7 @@ def main():
         sys.exit(2)
     
     # Run the check
-    results = check_warranty(cleaned_tags, bearer_token=args.token)
+    results = check_warranty(cleaned_tags, bearer_token=args.token, use_techdirect=args.techdirect)
     
     if results is None:
         sys.exit(2)
